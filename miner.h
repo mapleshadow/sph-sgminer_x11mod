@@ -388,10 +388,12 @@ enum cl_kernels {
 	KL_SIFCOIN,
 	KL_DARKCOIN,	// kernels starting from this will have difficulty calculated by using bitcoin algorithm
 	KL_MYRIADCOIN_GROESTL,
-	KL_X11MOD,
-	KL_FUGUECOIN,	// kernels starting from this will have difficulty calculated by using fuguecoin algorithm
+	KL_FUGUECOIN,
 	KL_GROESTLCOIN,
 	KL_TWECOIN,
+	KL_MARUCOIN,
+	KL_X11MOD,
+	KL_X13MOD,
 };
 
 enum dev_reason {
@@ -515,6 +517,8 @@ struct cgpu_info {
 	int gpu_memdiff;
 	int gpu_powertune;
 	float gpu_vddc;
+	int gpu_engine_exit;
+	int gpu_memclock_exit;
 #endif
 	double diff1;
 	double diff_accepted;
@@ -1060,6 +1064,8 @@ extern void api(int thr_id);
 extern struct pool *current_pool(void);
 extern int enabled_pools;
 extern void get_intrange(char *arg, int *val1, int *val2);
+extern void get_intexitval(char *arg, int *val1, int *val2);
+extern void get_intrangeexitval(char *arg, int *val1, int *val2, int *val3);
 extern bool detect_stratum(struct pool *pool, char *url);
 extern void print_summary(void);
 extern void adjust_quota_gcd(void);
@@ -1513,7 +1519,6 @@ enum diff_calc_mode {
 	DM_BITCOIN,
 	DM_QUARKCOIN,
 	DM_LITECOIN,
-	DM_FUGUECOIN,
 };
 
 #endif /* __MINER_H__ */

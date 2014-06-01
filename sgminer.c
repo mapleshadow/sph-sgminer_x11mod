@@ -1,3 +1,4 @@
+
 /*
  * Copyright 2011-2013 Con Kolivas
  * Copyright 2011-2012 Luke Dashjr
@@ -96,6 +97,7 @@ int opt_expiry = 28;
 static const bool opt_time = true;
 unsigned long long global_hashrate;
 unsigned long global_quota_gcd = 1;
+bool opt_show_coindiff = false;
 time_t last_getwork;
 
 int nDevs;
@@ -150,6 +152,7 @@ int opt_tcp_keepalive = 30;
 #else
 int opt_tcp_keepalive;
 #endif
+double opt_diff_mult = 1.0;
 
 char *opt_kernel_path;
 char *sgminer_path;
@@ -300,7 +303,7 @@ struct schedtime schedstart;
 struct schedtime schedstop;
 bool sched_paused;
 
-#define DM_SELECT(x, y, z, w) (dm_mode == DM_BITCOIN ? x : (dm_mode == DM_QUARKCOIN ? y : (dm_mode == DM_FUGUECOIN ? w : z) ))
+#define DM_SELECT(x, y, z) (dm_mode == DM_BITCOIN ? x : (dm_mode == DM_QUARKCOIN ? y : z))
 
 enum diff_calc_mode dm_mode = DM_LITECOIN;
 
@@ -528,6 +531,7 @@ struct pool *add_pool(void)
 	/* Default pool name */
 	char buf[32];
 	sprintf(buf, "Pool %d", pool->pool_no);
+
 	pool->poolname = strdup(buf);
 
 	pools = realloc(pools, sizeof(struct pool *) * (total_pools + 2));
@@ -624,6 +628,25 @@ void get_intrange(char *arg, int *val1, int *val2)
 {
 	if (sscanf(arg, "%d-%d", val1, val2) == 1)
 		*val2 = *val1;
+}
+
+void get_intexitval(char *arg, int *val1, int *val2)
+{
+	if (sscanf(arg, "%d:%d", val1, val2) == 1)
+		*val2 = *val1;
+}
+
+void get_intrangeexitval(char *arg, int *val1, int *val2, int *val3)
+{
+	if (sscanf(arg, "%d:%d", val2, val3) == 2)
+	{
+		*val1 = *val2;
+	}
+	else if (sscanf(arg, "%d-%d:%d", val1, val2, val3) != 3)
+	{
+		get_intrange(arg, val1, val2);
+		*val3 = *val2;
+	}
 }
 
 static char *set_devices(char *arg)
@@ -1055,6 +1078,18 @@ static char *set_null(const char __maybe_unused *arg)
 	return NULL;
 }
 
+char *set_difficulty_multiplier(char *arg)
+{
+	char **endptr = NULL;
+	if (!(arg && arg[0]))
+		return "Invalid parameters for set difficulty multiplier";
+	opt_diff_mult = strtod(arg, endptr);
+	if (opt_diff_mult == 0 || endptr == arg)
+		return "Invalid value passed to set difficulty multiplier";
+
+	return NULL;
+}
+
 /* These options are available from config file or commandline */
 static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--api-allow",
@@ -1288,6 +1323,9 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--socks-proxy",
 		     opt_set_charp, NULL, &opt_socks_proxy,
 		     "Set socks4 proxy (host:port)"),
+	OPT_WITHOUT_ARG("--show-coindiff",
+			opt_set_bool, &opt_show_coindiff,
+			"Show coin difficulty rather than hash value of a share"),
 	OPT_WITH_ARG("--state",
 		     set_pool_state, NULL, NULL,
 		     "Specify pool state at startup (default: enabled)"),
@@ -1354,6 +1392,9 @@ static struct opt_table opt_config_table[] = {
 			"Display extra work time debug information"),
 	OPT_WITH_ARG("--pools",
 			opt_set_bool, NULL, NULL, opt_hidden),
+	OPT_WITH_ARG("--difficulty-multiplier",
+			set_difficulty_multiplier, NULL, NULL, 
+			"Difficulty multiplier for jobs received from stratum pools"),
 	OPT_ENDTABLE
 };
 
@@ -1733,6 +1774,16 @@ static void update_gbt(struct pool *pool)
 	curl_easy_cleanup(curl);
 }
 
+/* Return the work coin/network difficulty */
+static double get_work_coindiff(const struct work *work)
+{
+	uint8_t pow = work->data[72];
+	int powdiff = (8 * (0x1d - 3)) - (8 * (pow - 3));
+	uint32_t diff32 = be32toh(*((uint32_t *)(work->data + 72))) & 0x00FFFFFF;
+	double numerator = 0xFFFFULL << powdiff;
+	return numerator / (double)diff32;
+}
+
 static void gen_gbt_work(struct pool *pool, struct work *work)
 {
 	unsigned char *merkleroot;
@@ -2084,7 +2135,7 @@ static void suffix_string(uint64_t val, char *buf, size_t bufsiz, int sigdigits)
 static void suffix_string_double(double val, char *buf, size_t bufsiz, int sigdigits)
 {
 	if (val < 10) {
-		snprintf(buf, bufsiz, "%.3lf", val);
+		snprintf(buf, bufsiz, "%.3f", val);
 	} else {
 		return suffix_string(val, buf, bufsiz, sigdigits);
 	}
@@ -2155,12 +2206,36 @@ static bool shared_strategy(void)
 } while (0)
 
 /* Must be called with curses mutex lock held and curses_active */
+static void curses_print_uptime(void)
+{
+	struct timeval now, tv;
+	unsigned int days, hours;
+	div_t d;
+
+	cgtime(&now);
+	timersub(&now, &total_tv_start, &tv);
+	d = div(tv.tv_sec, 86400);
+	days = d.quot;
+	d = div(d.rem, 3600);
+	hours = d.quot;
+	d = div(d.rem, 60);
+	cg_wprintw(statuswin, " - [%u day%c %02d:%02d:%02d]"
+		, days
+		, (days == 1) ? ' ' : 's'
+		, hours
+		, d.quot
+		, d.rem
+	);
+}
+
+/* Must be called with curses mutex lock held and curses_active */
 static void curses_print_status(void)
 {
 	struct pool *pool = current_pool();
 
 	wattron(statuswin, A_BOLD);
 	cg_mvwprintw(statuswin, 0, 0, PACKAGE " " VERSION " - Started: %s", datestamp);
+	curses_print_uptime();
 	wattroff(statuswin, A_BOLD);
 	mvwhline(statuswin, 1, 0, '-', 80);
 	cg_mvwprintw(statuswin, 2, 0, "%s", statusline);
@@ -2254,8 +2329,9 @@ static void curses_print_devstatus(struct cgpu_info *cgpu, int count)
 	adj_width(cgpu->hw_errors, &hwwidth);
 	adj_width(wu, &wuwidth);
 
-	cg_wprintw(statuswin, "/%6sh/s | R:%*.1f%% HW:%*d WU:%*.3f/m",
+	cg_wprintw(statuswin, "/%6sh/s | A:%d R:%*.1f%% HW:%*d WU:%*.3f/m",
 			displayed_hashes,
+			cgpu->accepted,
 			drwidth, reject_pct,
 			hwwidth, cgpu->hw_errors,
 			wuwidth + 2, wu);
@@ -2435,7 +2511,7 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 		pool->last_share_diff = work->work_difficulty;
 		applog(LOG_DEBUG, "PROOF OF WORK RESULT: true (yay!!!)");
 		if (!QUIET) {
-			if (total_pools > 1) {
+			if (total_pools > 0) {
 				applog(LOG_NOTICE, "Accepted %s %s %d at %s %s%s",
 				       hashshow, cgpu->drv->name, cgpu->device_id, pool->poolname, resubmit ? "(resubmit)" : "", worktime);
 			} else
@@ -2540,20 +2616,23 @@ static void show_hash(struct work *work, char *hashshow)
 	char diffdisp[16], wdiffdisp[16];
 	unsigned long h32;
 	uint32_t *hash32;
-	int intdiff, ofs;
+	int ofs;
 
-	swab256(rhash, work->hash);
-	for (ofs = 0; ofs <= 28; ofs ++) {
-		if (rhash[ofs])
-			break;
-	}
-	hash32 = (uint32_t *)(rhash + ofs);
-	h32 = be32toh(*hash32);
-	intdiff = round(work->work_difficulty);
 	suffix_string_double(work->share_diff, diffdisp, sizeof (diffdisp), 0);
 	suffix_string_double(work->work_difficulty, wdiffdisp, sizeof (wdiffdisp), 0);
-	snprintf(hashshow, 64, "%08lx Diff %s/%s%s", h32, diffdisp, wdiffdisp,
-		 work->block? " BLOCK!" : "");
+	if (opt_show_coindiff) {
+		snprintf(hashshow, 64, "Coin %.0f Diff %s/%s%s", get_work_coindiff(work), diffdisp, wdiffdisp, work->block? " BLOCK!" : "");
+	} else {
+		swab256(rhash, work->hash);
+		for (ofs = 0; ofs <= 28; ofs ++) {
+			if (rhash[ofs])
+				break;
+		}
+		hash32 = (uint32_t *)(rhash + ofs);
+		h32 = be32toh(*hash32);
+		snprintf(hashshow, 64, "%08lx Diff %s/%s%s", h32, diffdisp, wdiffdisp,
+			 work->block? " BLOCK!" : "");
+	}
 }
 
 #ifdef HAVE_LIBCURL
@@ -2962,7 +3041,7 @@ static void calc_diff(struct work *work, double known)
 	else {
 		double d64, dcut64;
 
-		d64 = (double) DM_SELECT(1, 256, 65536, 256) * truediffone;
+		d64 = (double) DM_SELECT(1, 256, 65536) * truediffone;
 
 		dcut64 = le256todouble(work->target);
 		if (unlikely(!dcut64))
@@ -3579,7 +3658,7 @@ static double share_diff(const struct work *work)
 	double d64, s64;
 	double ret;
 
-	d64 = (double) DM_SELECT(1, 256, 65536, 256) * truediffone;
+	d64 = (double) DM_SELECT(1, 256, 65536) * truediffone;
 	s64 = le256todouble(work->hash);
 	if (unlikely(!s64))
 		s64 = 0;
@@ -3902,7 +3981,7 @@ static void set_blockdiff(const struct work *work)
 	uint8_t pow = work->data[72];
 	int powdiff = (8 * (0x1d - 3)) - (8 * (pow - 3));
 	uint32_t diff32 = be32toh(*((uint32_t *)(work->data + 72))) & 0x00FFFFFF;
-	double numerator = DM_SELECT(0xFFFFULL, 0xFFFFFFULL, 0xFFFFFFFFULL, 0xFFFFULL) << powdiff;
+	double numerator = DM_SELECT(0xFFFFULL, 0xFFFFFFULL, 0xFFFFFFFFULL) << powdiff;
 	double ddiff = numerator / (double)diff32;
 
 	if (unlikely(current_diff != ddiff)) {
@@ -4257,8 +4336,14 @@ void write_config(FILE *fcfg)
 				case KL_TWECOIN:
 					fprintf(fcfg, TWECOIN_KERNNAME);
 					break;
+				case KL_MARUCOIN:
+					fprintf(fcfg, MARUCOIN_KERNNAME);
+					break;
 				case KL_X11MOD:
 					fprintf(fcfg, X11MOD_KERNNAME);
+					break;
+				case KL_X13MOD:
+					fprintf(fcfg, X13MOD_KERNNAME);
 					break;
 			}
 		}
@@ -4286,7 +4371,8 @@ void write_config(FILE *fcfg)
 #ifdef HAVE_ADL
 		fputs("\",\n\"gpu-engine\" : \"", fcfg);
 		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d-%d", i > 0 ? "," : "", gpus[i].min_engine, gpus[i].gpu_engine);
+			fprintf(fcfg, gpus[i].gpu_engine_exit != gpus[i].gpu_engine ? "%s%d-%d:%d" : "%s%d-%d",
+			i > 0 ? "," : "", gpus[i].min_engine, gpus[i].gpu_engine, gpus[i].gpu_engine_exit);
 
 		fputs("\",\n\"gpu-fan\" : \"", fcfg);
 		for(i = 0; i < nDevs; i++)
@@ -4294,7 +4380,8 @@ void write_config(FILE *fcfg)
 
 		fputs("\",\n\"gpu-memclock\" : \"", fcfg);
 		for(i = 0; i < nDevs; i++)
-			fprintf(fcfg, "%s%d", i > 0 ? "," : "", gpus[i].gpu_memclock);
+			fprintf(fcfg, gpus[i].gpu_memclock_exit != gpus[i].gpu_memclock ? "%s%d:%d" : "%s%d",
+			i > 0 ? "," : "", gpus[i].gpu_memclock, gpus[i].gpu_memclock_exit);
 
 		fputs("\",\n\"gpu-memdiff\" : \"", fcfg);
 		for(i = 0; i < nDevs; i++)
@@ -5054,10 +5141,10 @@ static void hashmeter(int thr_id, struct timeval *diff,
 	suffix_string(dr64, displayed_rolling, sizeof(displayed_rolling), 4);
 
 	snprintf(statusline, sizeof(statusline),
-		"%s(%ds):%s (avg):%sh/s | A:%.0f  R:%.0f  HW:%d  WU:%.3f/m",
+		"%s(%ds):%s (avg):%sh/s | A:%d  R:%d  HW:%d  WU:%.3f/m",
 		want_per_device_stats ? "ALL " : "",
 		opt_log_interval, displayed_rolling, displayed_hashes,
-		total_diff_accepted, total_diff_rejected, hw_errors,
+		total_accepted, total_rejected, hw_errors,
 		total_diff1 / total_secs * 60);
 
 	local_mhashes_done = 0;
@@ -5791,6 +5878,13 @@ static struct work *hash_pop(bool blocking)
 			if (rc && !no_work) {
 				no_work = true;
 				applog(LOG_WARNING, "Waiting for work to be available from pools.");
+				#ifdef HAVE_ADL
+				// Set all GPUs to idle (same as exit and disabled) state.
+				applog(LOG_WARNING, "Setting GPUs to idle performance.");
+				int i;
+				for(i = 0; i < nDevs; i++)
+				adl_reset_device(i, true, false);
+				#endif
 			}
 		} while (!HASH_COUNT(staged_work));
 	}
@@ -5830,6 +5924,7 @@ out_unlock:
 static void gen_hash(unsigned char *data, unsigned char *hash, int len)
 {
 	unsigned char hash1[32];
+
 	sha256(data, len, hash1);
 	sha256(hash1, 32, hash);
 }
@@ -5847,7 +5942,7 @@ void set_target(unsigned char *dest_target, double diff)
 	}
 
 	// FIXME: is target set right?
-	d64 = (double) DM_SELECT(1, 256, 65536, 256) * truediffone;
+	d64 = (double) DM_SELECT(1, 256, 65536) * truediffone;
 	d64 /= diff;
 
 	dcut64 = d64 / bits192;
@@ -5880,6 +5975,7 @@ void set_target(unsigned char *dest_target, double diff)
 
 	if (opt_debug) {
 		char *htarget = bin2hex(target, 32);
+
 		applog(LOG_DEBUG, "Generated target %s", htarget);
 		free(htarget);
 	}
@@ -5909,9 +6005,8 @@ static void gen_stratum_work(struct pool *pool, struct work *work)
 	cg_dwlock(&pool->data_lock);
 
 	/* Generate merkle root */
-	if (gpus[i].kernel == KL_FUGUECOIN || gpus[i].kernel == KL_GROESTLCOIN || gpus[i].kernel == KL_TWECOIN) {
+	if (gpus[0].kernel == KL_FUGUECOIN || gpus[0].kernel == KL_GROESTLCOIN || gpus[0].kernel == KL_TWECOIN)
 		sha256(pool->coinbase, pool->swork.cb_len, merkle_root);
-	}
 	else
 		gen_hash(pool->coinbase, merkle_root, pool->swork.cb_len);
 	memcpy(merkle_sha, merkle_root, 32);
@@ -6097,6 +6192,10 @@ static void rebuild_nonce(struct work *work, uint32_t nonce)
 		case KL_TWECOIN:
 			twecoin_regenhash(work);
 			break;
+		case KL_MARUCOIN:
+		case KL_X13MOD:
+			marucoin_regenhash(work);
+			break;
 		default:
 			scrypt_regenhash(work);
 			break;
@@ -6121,7 +6220,7 @@ bool test_nonce_diff(struct work *work, uint32_t nonce, double diff)
 	uint64_t *hash64 = (uint64_t *)(work->hash + 24), diff64;
 
 	rebuild_nonce(work, nonce);
-	diff64 = DM_SELECT(0x00000000ffff0000ULL, 0x000000ffff000000ULL, 0x0000ffff00000000ULL, 0x00000000ffff0000ULL);
+	diff64 = DM_SELECT(0x00000000ffff0000ULL, 0x000000ffff000000ULL, 0x0000ffff00000000ULL);
 	diff64 /= diff;
 
 	return (le64toh(*hash64) <= diff64);
@@ -6130,11 +6229,11 @@ bool test_nonce_diff(struct work *work, uint32_t nonce, double diff)
 static void update_work_stats(struct thr_info *thr, struct work *work)
 {
 	double test_diff = current_diff;
-	test_diff *= DM_SELECT(1, 256, 65536, 256);
+	test_diff *= DM_SELECT(1, 256, 65536);
 
 	work->share_diff = share_diff(work);
 
-	test_diff *= DM_SELECT(1, 256, 65536, 256);
+	test_diff *= DM_SELECT(1, 256, 65536);
 
 	if (unlikely(work->share_diff >= test_diff)) {
 		work->block = true;
@@ -7077,7 +7176,7 @@ static void *watchpool_thread(void __maybe_unused *userdata)
  * the screen at regular intervals, and restarts threads if they appear to have
  * died. */
 #define WATCHDOG_INTERVAL		2
-#define WATCHDOG_SICK_TIME		120
+#define WATCHDOG_SICK_TIME		240
 #define WATCHDOG_DEAD_TIME		600
 #define WATCHDOG_SICK_COUNT		(WATCHDOG_SICK_TIME/WATCHDOG_INTERVAL)
 #define WATCHDOG_DEAD_COUNT		(WATCHDOG_DEAD_TIME/WATCHDOG_INTERVAL)
